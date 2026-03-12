@@ -1,0 +1,4 @@
+venv_2004/
+__pycache__/
+.vscode/
+*.pt
