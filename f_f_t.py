@@ -126,26 +126,27 @@ class FaceServoTracker:
                 
                 # 计算X轴目标角度
                 target_angle_x = ((face_cx / w) - 0.5) * 2 * self.limit_x
+                raw_target_y = ((face_cy / h) - 0.5) * 2 * 40.0
                 
-                # 计算Y轴原始目标角度
-                # 图像坐标系中，上半部分y较小，计算结果为负，即负数代表仰头
-                raw_target_y = ((face_cy / h) - 0.5) * 2 * self.limit_y_base
-                
-                # 硬件干涉保护：对Y轴进行非对称限幅截断
+                # 严格的非对称物理防干涉限位：仰视极限 15度，俯视极限 30度
                 target_angle_y = max(-self.limit_y_up, min(self.limit_y_down, raw_target_y))
                 
-                # 送入仿生滤波器获取非线性平滑坐标
+                # 经过仿生滤波器平滑处理
                 self.current_angle_x = self.filter_x.update(target_angle_x)
                 self.current_angle_y = self.filter_y.update(target_angle_y)
 
-                # 独立轴映射逻辑，确保0度时PWM输出精准为500
-                range_x_total = self.limit_x * 2.0
-                range_y_total = self.limit_y_base * 2.0
+                # ---------------------------------------------------------
+                # 物理驱动域：基于机械常数的绝对坐标计算
+                # ---------------------------------------------------------
+                # 机械传动常数: 1000 PWM / 240 Degree = 4.1667
+                MECHANICAL_CONSTANT = 4.1667
                 
-                servo_x = int((self.current_angle_x + self.limit_x) * (1000.0 / range_x_total))
-                servo_y = int((self.current_angle_y + self.limit_y_base) * (1000.0 / range_y_total))
+                # 以 500 为绝对基准零点进行线性叠加
+                # 注：若实际运行中方向相反，只需将加号改为减号即可翻转相位
+                servo_x = int(500 + (self.current_angle_x * MECHANICAL_CONSTANT))
+                servo_y = int(500 + (self.current_angle_y * MECHANICAL_CONSTANT))
                 
-                # 最终总线指令安全兜底
+                # 最终总线指令安全兜底，防止溢出 0-1000 量程
                 servo_x = max(0, min(1000, servo_x))
                 servo_y = max(0, min(1000, servo_y))
                 
