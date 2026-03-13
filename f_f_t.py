@@ -2,17 +2,25 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import math
-
-# 严谨的低通滤波器（EMA）：用于消除画面噪点导致的舵机抖动
-# 取代了之前复杂的 PID 控制器
-class EMAFilter:
-    def __init__(self, alpha=0.2):
-        self.alpha = alpha
+import serial
+class BiologicalFilter:#dongtaic filter for smoother tracking response
+    def __init__(self, base_alpha=0.03, dynamic_factor=0.3):
+        self.base_alpha = base_alpha
+        self.dynamic_factor = dynamic_factor
         self.current_value = 0.0
 
     def update(self, target):
-        # 核心逻辑：当前值逐步逼近目标值，alpha 越小越平滑但越迟钝
-        self.current_value += (target - self.current_value) * self.alpha
+        # 计算当前物理位置与目标位置的绝对误差
+        error = target - self.current_value
+        
+        # 归一化误差比例，假定最大合理追踪偏角为 80 度
+        error_ratio = min(abs(error) / 80.0, 1.0)
+        
+        # 核心算法：误差越大，平滑系数越趋近 1；误差趋近 0 时，系数回归极小的底座值
+        dynamic_alpha = self.base_alpha + (error_ratio * self.dynamic_factor)
+        
+        # 位置更新
+        self.current_value += error * dynamic_alpha
         return self.current_value
 
 class FaceServoTracker:
@@ -20,16 +28,23 @@ class FaceServoTracker:
         self.session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
         self.input_name = self.session.get_inputs()[0].name
         
-        # 使用低通滤波器代替 PID
-        self.filter_x = EMAFilter(alpha=0.25)
-        self.filter_y = EMAFilter(alpha=0.25)
+        self.filter_x = BiologicalFilter(base_alpha=0.05, dynamic_factor=0.25)#base越大越快，dynamic越大越能适应大幅度变化但可能引入震荡
+        self.filter_y = BiologicalFilter(base_alpha=0.05, dynamic_factor=0.25)
         
         self.current_angle_x = 0.0
         self.current_angle_y = 0.0
+    
+        self.limit_x = 40.0
+        self.limit_y_base = 40.0
         
-        # 硬限位
-        self.limit_max = 70
+        # Y轴非对称物理限位
+        self.limit_y_up = 15.0    # 仰头极限角度
+        self.limit_y_down = 30.0  # 低头极限角度
 
+        try:
+            self.ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.01)
+        except serial.SerialException:
+            pass
     def preprocess(self, frame):
         img = cv2.resize(frame, (640, 640))
         img = img.astype(np.float32) / 255.0
@@ -93,30 +108,62 @@ class FaceServoTracker:
             results = self.postprocess(outputs, w, h)
             
             if results:
-                (x, y, bw, bh), _ = results[0]
+                # 面积过滤逻辑：遍历所有识别结果，计算边界框面积，锁定最大目标
+                best_face = results[0]
+                max_area = 0
+                
+                for face_data in results:
+                    # face_data 的结构为 ((x, y, bw, bh), score)
+                    box = face_data[0]
+                    area = box[2] * box[3]
+                    if area > max_area:
+                        max_area = area
+                        best_face = face_data
+                
+                # 仅解包最大人脸的数据进行跟踪计算
+                (x, y, bw, bh), _ = best_face
                 face_cx, face_cy = x + bw // 2, y + bh // 2
                 
-                # 绝对映射逻辑：将像素坐标直接映射为目标角度
-                target_angle_x = ((face_cx / w) - 0.5) * 2 * self.limit_max
-                target_angle_y = ((face_cy / h) - 0.5) * 2 * self.limit_max
+                # 计算X轴目标角度
+                target_angle_x = ((face_cx / w) - 0.5) * 2 * self.limit_x
                 
-                # 反转 Y 轴，符合常规舵机逻辑
-                target_angle_y = -target_angle_y
+                # 计算Y轴原始目标角度
+                # 图像坐标系中，上半部分y较小，计算结果为负，即负数代表仰头
+                raw_target_y = ((face_cy / h) - 0.5) * 2 * self.limit_y_base
                 
-                # 经过滤波器平滑处理，防止舵机发抖
+                # 硬件干涉保护：对Y轴进行非对称限幅截断
+                target_angle_y = max(-self.limit_y_up, min(self.limit_y_down, raw_target_y))
+                
+                # 送入仿生滤波器获取非线性平滑坐标
                 self.current_angle_x = self.filter_x.update(target_angle_x)
                 self.current_angle_y = self.filter_y.update(target_angle_y)
+
+                # 独立轴映射逻辑，确保0度时PWM输出精准为500
+                range_x_total = self.limit_x * 2.0
+                range_y_total = self.limit_y_base * 2.0
                 
-                print(f"SERVO_ABS -> X: {self.current_angle_x:+05.1f}°, Y: {self.current_angle_y:+05.1f}°")
+                servo_x = int((self.current_angle_x + self.limit_x) * (1000.0 / range_x_total))
+                servo_y = int((self.current_angle_y + self.limit_y_base) * (1000.0 / range_y_total))
                 
+                # 最终总线指令安全兜底
+                servo_x = max(0, min(1000, servo_x))
+                servo_y = max(0, min(1000, servo_y))
+                
+                cmd = f"X{servo_x}Y{servo_y}\n"
+                
+                try:
+                    self.ser.write(cmd.encode())
+                except Exception:
+                    pass
+                
+                # 在画面上标记当前锁定的唯一目标
                 cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
                 cv2.circle(frame, (face_cx, face_cy), 5, (0, 0, 255), -1)
-                cv2.line(frame, (w // 2, h // 2), (face_cx, face_cy), (0, 255, 255), 1)
+                
+                # 可以在画面左上角打印锁定状态，方便调试
+                cv2.putText(frame, f"Locked Area: {max_area}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            dashboard_img = self.render_dashboard()
-            
             cv2.imshow("Vision Tracking", frame)
-            cv2.imshow("Motor Telemetry", dashboard_img)
             
             if cv2.waitKey(1) & 0xFF == ord('q'): break
             
