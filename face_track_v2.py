@@ -105,6 +105,10 @@ class TrackerConfig:
         self.k_tilt = 8.0
         self.deadband = 0.05
         
+        # 前馈控制系数（经验值）
+        self.k_ff_pan = 0.3  # 水平方向前馈增益
+        self.k_ff_tilt = 0.2  # 垂直方向前馈增益
+        
         # 物理限制
         self.limit_x = 40.0
         self.limit_y_up = 15.0
@@ -203,20 +207,49 @@ class FaceServoTracker:
         self.last_angle_x = 0.0
         self.last_angle_y = 0.0
         
-        # 目标锁定机制（暂时保留但未使用）
-        self.locked_face_id = -1
+        # 多目标追踪策略相关变量
+        self.locked_face_id = -1  # 锁定目标的唯一标识
+        self.locked_face_center = None  # 锁定目标的中心坐标 (cx, cy)
+        self.locked_frame_count = 0  # 已连续锁定的帧数
+        self.locked_face_area = 0.0  # 锁定目标的框面积
+        self.last_face_centers = []  # 上一帧所有人脸中心列表
         self.target_consistency_threshold = 0.7  # 目标一致性阈值
+        
+        # 场景A锁定切换相关变量
+        self.potential_switch_face_id = -1  # 潜在切换目标的ID
+        self.potential_switch_start_time = 0.0  # 潜在切换开始时间
+        self.potential_switch_area = 0.0  # 潜在切换目标的面积
+        
+        # 前馈控制相关变量
+        self.last_err_x = 0.0
+        self.last_err_y = 0.0
         
         print("跟踪器初始化完成，使用配置:")
         print(f"  - 控制参数: K_PAN={self.config.k_pan}, K_TILT={self.config.k_tilt}")
+        print(f"  - 前馈系数: K_FF_PAN={self.config.k_ff_pan}, K_FF_TILT={self.config.k_ff_tilt}")
         print(f"  - 物理限制: X={self.config.limit_x}°, Y=({self.config.limit_y_up}° to {self.config.limit_y_down}°)")
         print(f"  - 机械约束: 最大速度 X={self.config.max_velocity_x}°/帧, Y={self.config.max_velocity_y}°/帧")
 
     def preprocess(self, frame):
-        img = cv2.resize(frame, (640, 640))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))
-        return np.expand_dims(img, axis=0)
+        """
+        使用 OpenCV 的 blobFromImage 进行高效预处理
+        替代手动 NumPy 操作，利用 C++ 底层加速
+        参数说明：
+          scalefactor=1.0/255.0: 实现 [0,1] 归一化
+          size=(640, 640): 模型输入尺寸
+          swapRB=True: BGR 转 RGB
+          crop=False: 不裁剪
+          ddepth=cv2.CV_32F: 32位浮点输出
+        """
+        blob = cv2.dnn.blobFromImage(
+            frame,
+            scalefactor=1.0/255.0,
+            size=(640, 640),
+            swapRB=True,
+            crop=False,
+            ddepth=cv2.CV_32F
+        )
+        return blob
 
     def postprocess(self, outputs, orig_w, orig_h):
         predictions = np.squeeze(outputs[0]).T
@@ -272,6 +305,18 @@ class FaceServoTracker:
                 self.filter_y.current_value = 0.0
                 self.last_sent_x = -1
                 self.last_sent_y = -1
+                
+                # 重置多目标追踪状态
+                self.locked_face_id = -1
+                self.locked_face_center = None
+                self.locked_frame_count = 0
+                self.locked_face_area = 0.0
+                self.last_face_centers = []
+                
+                # 重置场景A锁定切换状态
+                self.potential_switch_face_id = -1
+                self.potential_switch_start_time = 0.0
+                self.potential_switch_area = 0.0
                 
                 # 重置人脸丢失计数器
                 self.face_lost_counter = 0
@@ -358,8 +403,8 @@ class FaceServoTracker:
                 cap_test.release()
                 print(f"使用指定的摄像头: 索引 {camera_index}")
         
-        # 初始化摄像头
-        cap = cv2.VideoCapture(4)
+        # 初始化摄像头 - 使用命令行传入的索引，删除硬编码
+        cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
             print(f"错误: 无法打开摄像头索引 {camera_index}")
             return
@@ -422,29 +467,152 @@ class FaceServoTracker:
                 self.last_face_time = time.time()
                 self.is_resetting = False
                 
-                # 安全地选择最大面积的人脸
-                best_face = results[0]
-                max_area = 0
+                # 多目标追踪策略：根据人脸数量选择不同的匹配策略
+                face_count = len(results)
                 
+                # 提取所有人脸的中心坐标和面积
+                current_face_centers = []
+                face_areas = []
                 for face_data in results:
                     box = face_data[0]
-                    area = box[2] * box[3]
-                    if area > max_area:
-                        max_area = area
-                        best_face = face_data
+                    x, y, bw, bh = box
+                    cx, cy = x + bw // 2, y + bh // 2
+                    area = bw * bh
+                    current_face_centers.append((cx, cy))
+                    face_areas.append(area)
                 
-                (x, y, bw, bh), _ = best_face
+                # 场景判断：人脸数量决定追踪策略
+                if face_count < 3:
+                    # 场景 A：人脸数量少于3人，使用智能锁定策略
+                    current_time = time.time()
+                    
+                    if self.locked_face_id == -1:
+                        # 如果没有锁定目标，选择面积最大的人脸并锁定
+                        selected_idx = face_areas.index(max(face_areas))
+                        self.locked_face_id = current_time  # 使用时间戳作为唯一标识
+                        self.locked_face_center = current_face_centers[selected_idx]
+                        self.locked_face_area = face_areas[selected_idx]
+                        self.locked_frame_count = 1
+                        print(f"场景A：锁定初始目标，面积={self.locked_face_area:.0f}")
+                    else:
+                        # 已经锁定目标：检查是否需要切换
+                        # 1. 首先找到距离锁定目标最近的人脸（保持追踪连续性）
+                        min_distance = float('inf')
+                        nearest_idx = 0
+                        for idx, (cx, cy) in enumerate(current_face_centers):
+                            distance = math.sqrt((cx - self.locked_face_center[0])**2 + 
+                                                (cy - self.locked_face_center[1])**2)
+                            if distance < min_distance:
+                                min_distance = distance
+                                nearest_idx = idx
+                        
+                        # 2. 检查是否有更大的人脸（面积大20%以上）
+                        max_area_idx = face_areas.index(max(face_areas))
+                        max_area = face_areas[max_area_idx]
+                        
+                        # 计算面积比例：新人脸面积 / 当前锁定人脸面积
+                        if max_area_idx != nearest_idx and max_area > self.locked_face_area * 1.2:
+                            # 发现更大的人脸，检查是否已经跟踪了一段时间
+                            if self.potential_switch_face_id == max_area_idx:
+                                # 同一个潜在目标，检查是否已经跟踪了5秒
+                                if current_time - self.potential_switch_start_time >= 5.0:
+                                    # 5秒已过，切换锁定目标
+                                    selected_idx = max_area_idx
+                                    self.locked_face_id = current_time
+                                    self.locked_face_center = current_face_centers[selected_idx]
+                                    self.locked_face_area = face_areas[selected_idx]
+                                    self.locked_frame_count = 1
+                                    self.potential_switch_face_id = -1
+                                    print(f"场景A：切换锁定目标，新面积={self.locked_face_area:.0f} (+{(self.locked_face_area/face_areas[nearest_idx]-1)*100:.0f}%)")
+                                else:
+                                    # 继续跟踪潜在目标
+                                    selected_idx = nearest_idx
+                                    remaining_time = 5.0 - (current_time - self.potential_switch_start_time)
+                                    print(f"场景A：跟踪潜在切换目标，剩余{remaining_time:.1f}秒")
+                            else:
+                                # 新的潜在目标，开始计时
+                                self.potential_switch_face_id = max_area_idx
+                                self.potential_switch_start_time = current_time
+                                self.potential_switch_area = max_area
+                                selected_idx = nearest_idx
+                                print(f"场景A：发现更大的人脸，开始5秒计时（面积大{(max_area/self.locked_face_area-1)*100:.0f}%）")
+                        else:
+                            # 没有更大的目标，继续追踪当前锁定目标
+                            selected_idx = nearest_idx
+                            self.potential_switch_face_id = -1  # 重置潜在切换
+                        
+                        # 更新锁定目标的中心坐标和面积
+                        self.locked_face_center = current_face_centers[selected_idx]
+                        self.locked_face_area = face_areas[selected_idx]
+                        self.locked_frame_count += 1
+                else:
+                    # 场景 B：人脸数量大于或等于3人
+                    if self.locked_face_id == -1:
+                        # 如果当前未锁定目标：寻找离屏幕中心点最近的人脸
+                        screen_center_x, screen_center_y = w * 0.5, h * 0.5
+                        min_center_distance = float('inf')
+                        selected_idx = 0
+                        for idx, (cx, cy) in enumerate(current_face_centers):
+                            # 计算到屏幕中心的归一化距离
+                            norm_distance = math.sqrt(((cx / w) - 0.5)**2 + 
+                                                     ((cy / h) - 0.5)**2)
+                            if norm_distance < min_center_distance:
+                                min_center_distance = norm_distance
+                                selected_idx = idx
+                        
+                        # 锁定该目标
+                        self.locked_face_id = time.time()  # 使用时间戳作为唯一标识
+                        self.locked_face_center = current_face_centers[selected_idx]
+                        self.locked_frame_count = 1
+                        print(f"锁定目标：人脸{selected_idx}，中心坐标{self.locked_face_center}")
+                    else:
+                        # 已经锁定目标：通过距离关联继续跟踪
+                        if self.locked_face_center is not None:
+                            # 计算当前所有人脸中心与锁定目标的距离
+                            min_distance = float('inf')
+                            selected_idx = 0
+                            for idx, (cx, cy) in enumerate(current_face_centers):
+                                distance = math.sqrt((cx - self.locked_face_center[0])**2 + 
+                                                    (cy - self.locked_face_center[1])**2)
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    selected_idx = idx
+                            
+                            # 更新锁定目标的中心坐标
+                            self.locked_face_center = current_face_centers[selected_idx]
+                            self.locked_frame_count += 1
+                
+                # 获取选定的人脸信息
+                best_face = results[selected_idx]
+                (x, y, bw, bh), score = best_face
                 face_cx, face_cy = x + bw // 2, y + bh // 2
+                max_area = face_areas[selected_idx]
+                
+                # 保存当前帧的人脸中心供下一帧使用
+                self.last_face_centers = current_face_centers
                 
                 # 核心逻辑替换：计算画面像素的相对误差率 (-0.5 到 0.5 之间)
                 err_x = (face_cx / float(w)) - 0.5
                 err_y = (face_cy / float(h)) - 0.5
                 
-                # 闭环增量叠加：基于当前目标角度，按误差比例继续施加偏转
+                # 计算误差变化率（近似为目标速度）
+                if hasattr(self, 'last_err_x'):
+                    err_rate_x = err_x - self.last_err_x
+                    err_rate_y = err_y - self.last_err_y
+                else:
+                    err_rate_x = 0.0
+                    err_rate_y = 0.0
+                
+                # 保存当前误差供下一帧使用
+                self.last_err_x = err_x
+                self.last_err_y = err_y
+                
+                # 闭环增量叠加 + 前馈控制：基于当前目标角度，按误差比例继续施加偏转
+                # 控制量 = Kp * 误差 + Kff * 误差变化率
                 if abs(err_x) > DEADBAND:
-                    self.target_angle_x += err_x * K_PAN
+                    self.target_angle_x += err_x * K_PAN + err_rate_x * self.config.k_ff_pan
                 if abs(err_y) > DEADBAND:
-                    self.target_angle_y += err_y * K_TILT
+                    self.target_angle_y += err_y * K_TILT + err_rate_y * self.config.k_ff_tilt
                 
                 # 物理干涉截断：对累加后的虚拟目标进行无情限幅，保护打印件
                 self.target_angle_x = max(-self.config.limit_x, min(self.config.limit_x, self.target_angle_x))
@@ -479,12 +647,16 @@ class FaceServoTracker:
                 cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
                 cv2.circle(frame, (face_cx, face_cy), 5, (0, 0, 255), -1)
                 
-                # 显示角度信息
+                # 显示追踪状态信息
+                status_text = f"Faces: {face_count}"
+                if self.locked_face_id != -1:
+                    status_text += f" | Locked: {self.locked_frame_count}f"
+                
                 cv2.putText(frame, f"Pan: {self.current_angle_x:+.1f} deg", (10, 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, f"Tilt: {self.current_angle_y:+.1f} deg", (10, 60), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, f"Face Area: {max_area}", (10, 90), 
+                cv2.putText(frame, status_text, (10, 90), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 # 未检测到人脸
