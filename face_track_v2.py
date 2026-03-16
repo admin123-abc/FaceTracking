@@ -67,6 +67,7 @@ class SerialManager:
             try:
                 self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
                 print(f"SYS_INFO: 硬件通讯链路已建立: {self.port}")
+                time.sleep(2)  # 等待串口稳定
                 return True
             except serial.SerialException as e:
                 if attempt < self.max_retries - 1:
@@ -97,17 +98,27 @@ class TrackerConfig:
     """跟踪器配置类：集中管理所有参数"""
     def __init__(self):
         # 滤波器参数
-        self.filter_base_alpha = 0.15
-        self.filter_dynamic_factor = 0.35
+        self.filter_base_alpha = 0.1
+        self.filter_dynamic_factor = 0.28
         
         # 控制参数
-        self.k_pan = 13.8
-        self.k_tilt = 8.0
-        self.deadband = 0.05
+        self.k_pan = 6.25      # 水平比例增益（从8.0降低以减少超调）
+        self.k_tilt = 2.88     # 垂直比例增益（从3.25降低以减少超调）
+        self.deadband = 0.05  # 死区（从0.033增加，减少微小扰动）
         
-        # 前馈控制系数（经验值）
-        self.k_ff_pan = 0.3  # 水平方向前馈增益
-        self.k_ff_tilt = 0.2  # 垂直方向前馈增益
+        # PID控制器系数
+        self.ki_pan = 0.05    # 水平积分增益（用于消除稳态误差）
+        self.ki_tilt = 0.03   # 垂直积分增益（用于消除稳态误差）
+        self.kd_pan = 3.0     # 水平微分增益（用于抑制超调）
+        self.kd_tilt = 1.5    # 垂直微分增益（用于抑制超调）
+        
+        # 前馈控制系数（保留作为额外优化）
+        self.k_ff_pan = 0.3   # 水平前馈增益
+        self.k_ff_tilt = 0.2  # 垂直前馈增益
+        
+        # 积分限幅参数（防止积分饱和）
+        self.integral_limit_x = 15.0  # 水平最大积分量（度）
+        self.integral_limit_y = 10.0  # 垂直最大积分量（度）
         
         # 物理限制
         self.limit_x = 40.0
@@ -115,8 +126,8 @@ class TrackerConfig:
         self.limit_y_down = 30.0
         
         # 机械约束
-        self.max_velocity_x = 5.0  # 度/帧
-        self.max_velocity_y = 5.0  # 度/帧
+        self.max_velocity_x = 10.0  # 度/帧
+        self.max_velocity_y = 8.0  # 度/帧
         
         # 人脸丢失处理
         self.max_face_lost_frames = 30
@@ -224,9 +235,19 @@ class FaceServoTracker:
         self.last_err_x = 0.0
         self.last_err_y = 0.0
         
+        # PID控制器状态变量
+        self.integral_x = 0.0          # 水平积分器（累加误差）
+        self.integral_y = 0.0          # 垂直积分器（累加误差）
+        self.last_pid_error_x = 0.0    # 上次水平误差（用于计算微分）
+        self.last_pid_error_y = 0.0    # 上次垂直误差（用于计算微分）
+
         print("跟踪器初始化完成，使用配置:")
-        print(f"  - 控制参数: K_PAN={self.config.k_pan}, K_TILT={self.config.k_tilt}")
+        print(f"  - 比例参数: K_PAN={self.config.k_pan}, K_TILT={self.config.k_tilt}")
+        print(f"  - 积分参数: KI_PAN={self.config.ki_pan}, KI_TILT={self.config.ki_tilt}")
+        print(f"  - 微分参数: KD_PAN={self.config.kd_pan}, KD_TILT={self.config.kd_tilt}")
         print(f"  - 前馈系数: K_FF_PAN={self.config.k_ff_pan}, K_FF_TILT={self.config.k_ff_tilt}")
+        print(f"  - 积分限幅: INT_LIMIT_X={self.config.integral_limit_x}°, INT_LIMIT_Y={self.config.integral_limit_y}°")
+        print(f"  - 死区: DEADBAND={self.config.deadband}")
         print(f"  - 物理限制: X={self.config.limit_x}°, Y=({self.config.limit_y_up}° to {self.config.limit_y_down}°)")
         print(f"  - 机械约束: 最大速度 X={self.config.max_velocity_x}°/帧, Y={self.config.max_velocity_y}°/帧")
 
@@ -305,19 +326,27 @@ class FaceServoTracker:
                 self.filter_y.current_value = 0.0
                 self.last_sent_x = -1
                 self.last_sent_y = -1
-                
+
+                # 重置PID控制器状态
+                self.integral_x = 0.0
+                self.integral_y = 0.0
+                self.last_pid_error_x = 0.0
+                self.last_pid_error_y = 0.0
+                self.last_err_x = 0.0
+                self.last_err_y = 0.0
+
                 # 重置多目标追踪状态
                 self.locked_face_id = -1
                 self.locked_face_center = None
                 self.locked_frame_count = 0
                 self.locked_face_area = 0.0
                 self.last_face_centers = []
-                
+
                 # 重置场景A锁定切换状态
                 self.potential_switch_face_id = -1
                 self.potential_switch_start_time = 0.0
                 self.potential_switch_area = 0.0
-                
+
                 # 重置人脸丢失计数器
                 self.face_lost_counter = 0
                 return
@@ -595,24 +624,65 @@ class FaceServoTracker:
                 err_x = (face_cx / float(w)) - 0.5
                 err_y = (face_cy / float(h)) - 0.5
                 
-                # 计算误差变化率（近似为目标速度）
+                # 计算误差变化率（用于前馈控制）
                 if hasattr(self, 'last_err_x'):
                     err_rate_x = err_x - self.last_err_x
                     err_rate_y = err_y - self.last_err_y
                 else:
                     err_rate_x = 0.0
                     err_rate_y = 0.0
-                
+
                 # 保存当前误差供下一帧使用
                 self.last_err_x = err_x
                 self.last_err_y = err_y
-                
-                # 闭环增量叠加 + 前馈控制：基于当前目标角度，按误差比例继续施加偏转
-                # 控制量 = Kp * 误差 + Kff * 误差变化率
+
+                # 完整的PID控制器 + 前馈控制
+                # 控制量 = Kp * 误差 + Ki * ∫误差 + Kd * d误差/dt + Kff * 误差变化率
                 if abs(err_x) > DEADBAND:
-                    self.target_angle_x += err_x * K_PAN + err_rate_x * self.config.k_ff_pan
+                    # 积分项：累加误差
+                    self.integral_x += err_x
+                    # 积分限幅（防止积分饱和）
+                    self.integral_x = max(-self.config.integral_limit_x, 
+                                          min(self.config.integral_limit_x, self.integral_x))
+                    
+                    # 微分项：误差变化率
+                    derivative_x = err_x - self.last_pid_error_x
+                    
+                    # 完整的PID + 前馈控制量计算
+                    pid_output_x = (err_x * K_PAN +                    # 比例项
+                                    self.integral_x * self.config.ki_pan +  # 积分项
+                                    derivative_x * self.config.kd_pan +     # 微分项
+                                    
+                                    err_rate_x * self.config.k_ff_pan)      # 前馈项
+                    derivative_x = err_x - self.last_pid_error_x #一阶微分滤波
+                    
+                    self.target_angle_x += pid_output_x
+                    
+                    # 保存当前误差供下一帧微分计算
+                    self.last_pid_error_x = err_x
+                
                 if abs(err_y) > DEADBAND:
-                    self.target_angle_y += err_y * K_TILT + err_rate_y * self.config.k_ff_tilt
+                    # 积分项：累加误差
+                    self.integral_y += err_y
+                    # 积分限幅（防止积分饱和）
+                    self.integral_y = max(-self.config.integral_limit_y, 
+                                          min(self.config.integral_limit_y, self.integral_y))
+                    
+                    # 微分项：误差变化率
+                    derivative_y = err_y - self.last_pid_error_y
+                    
+                    # 完整的PID + 前馈控制量计算
+                    pid_output_y = (err_y * K_TILT +                    # 比例项
+                                    self.integral_y * self.config.ki_tilt +  # 积分项
+                                    derivative_y * self.config.kd_tilt +     # 微分项
+                                    
+                                    err_rate_y * self.config.k_ff_tilt)      # 前馈项
+                    derivative_y = err_y - self.last_pid_error_y #一阶微分滤波
+                    
+                    self.target_angle_y += pid_output_y
+                    
+                    # 保存当前误差供下一帧微分计算
+                    self.last_pid_error_y = err_y
                 
                 # 物理干涉截断：对累加后的虚拟目标进行无情限幅，保护打印件
                 self.target_angle_x = max(-self.config.limit_x, min(self.config.limit_x, self.target_angle_x))
@@ -724,7 +794,7 @@ x86主板部署建议:
     parser.add_argument(
         '--camera', 
         type=int, 
-        default=-1,
+        default=4,
         help='摄像头设备索引 (-1=自动检测, 0=第一个摄像头, 1=第二个摄像头, 以此类推)'
     )
     
